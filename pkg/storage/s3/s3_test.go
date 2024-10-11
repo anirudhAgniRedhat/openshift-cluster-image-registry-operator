@@ -363,9 +363,10 @@ func TestServiceEndpointCanBeOverwritten(t *testing.T) {
 }
 
 type tripper struct {
-	req           int
-	reqBodies     [][]byte
-	responseCodes []int
+	req            int
+	reqBodies      [][]byte
+	responseCodes  []int
+	responseBodies []string
 }
 
 func (r *tripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -386,14 +387,20 @@ func (r *tripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		code = r.responseCodes[r.req]
 	}
 
+	responseBody := "{}" // default empty JSON response
+	if r.req < len(r.responseBodies) {
+		responseBody = r.responseBodies[r.req]
+	}
+
 	return &http.Response{
 		StatusCode: code,
-		Body:       io.NopCloser(bytes.NewBufferString("{}")),
+		Body:       io.NopCloser(bytes.NewBufferString(responseBody)),
 	}, nil
 }
 
-func (r *tripper) AddResponse(code int) {
+func (r *tripper) AddResponse(code int, body string) {
 	r.responseCodes = append(r.responseCodes, code)
+	r.responseBodies = append(r.responseBodies, body)
 }
 
 func TestStorageManagementState(t *testing.T) {
@@ -513,7 +520,7 @@ func TestStorageManagementState(t *testing.T) {
 			rt := &tripper{}
 			if len(tt.responseCodes) > 0 {
 				for _, code := range tt.responseCodes {
-					rt.AddResponse(code)
+					rt.AddResponse(code, "")
 				}
 			}
 			TestFeatureGateAccessor := featuregates.NewHardcodedFeatureGateAccess(
@@ -758,7 +765,7 @@ func TestUserProvidedTags(t *testing.T) {
 			rt := &tripper{}
 			if len(tt.responseCodes) > 0 {
 				for _, code := range tt.responseCodes {
-					rt.AddResponse(code)
+					rt.AddResponse(code, "")
 				}
 			}
 			drv.roundTripper = rt
@@ -795,6 +802,226 @@ func TestUserProvidedTags(t *testing.T) {
 				return
 			}
 			t.Fatal("no request for tagging bucket found")
+		})
+	}
+}
+
+func TestGetStorageTags(t *testing.T) {
+	// Setup infrastructure and driver similar to existing tests
+	testBuilder := cirofake.NewFixturesBuilder()
+	testBuilder.AddInfraConfig(&configv1.Infrastructure{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster",
+		},
+		Status: configv1.InfrastructureStatus{
+			PlatformStatus: &configv1.PlatformStatus{
+				Type: configv1.AWSPlatformType,
+				AWS: &configv1.AWSPlatformStatus{
+					Region: "us-east-1",
+				},
+			},
+		},
+	})
+	testBuilder.AddSecrets(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      defaults.CloudCredentialsName,
+			Namespace: defaults.ImageRegistryOperatorNamespace,
+		},
+		Data: map[string][]byte{
+			"aws_access_key_id":     []byte("access"),
+			"aws_secret_access_key": []byte("secret"),
+		},
+	})
+	listers := testBuilder.BuildListers()
+
+	// Set up the round tripper and driver
+	rt := &tripper{}
+	TestFeatureGateAccessor := featuregates.NewHardcodedFeatureGateAccess(
+		[]configv1.FeatureGateName{util.TestFeatureGateName},
+		[]configv1.FeatureGateName{},
+	)
+
+	// Configure the driver with a valid bucket name in the Config field
+	driver := &driver{
+		Context:             context.TODO(),
+		Config:              &imageregistryv1.ImageRegistryConfigStorageS3{Bucket: "test-bucket"},
+		Listers:             &listers.StorageListers,
+		roundTripper:        rt,
+		featureGateAccessor: TestFeatureGateAccessor,
+	}
+
+	testCases := []struct {
+		name          string
+		responseBody  string
+		responseCodes []int
+		expectError   bool
+		expectedTags  map[string]string
+	}{
+		{
+			name: "successfully fetch tags",
+			responseBody: `
+			<GetBucketTaggingOutput>
+				<TagSet>
+					<Tag>
+						<Key>Key1</Key>
+						<Value>Value1</Value>
+					</Tag>
+					<Tag>
+						<Key>Key2</Key>
+						<Value>Value2</Value>
+					</Tag>
+				</TagSet>
+			</GetBucketTaggingOutput>`,
+			responseCodes: []int{http.StatusOK},
+			expectedTags: map[string]string{
+				"Key1": "Value1",
+				"Key2": "Value2",
+			},
+			expectError: false, // No error should be expected
+		},
+		{
+			name:          "no tags present (NoSuchTagSet error)",
+			responseCodes: []int{http.StatusNotFound},
+			expectedTags:  map[string]string{},
+			expectError:   false, // No error expected for NoSuchTagSet
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			rt.reqBodies = nil
+			rt.responseCodes = tt.responseCodes
+			rt.responseBodies = nil // Reset response bodies
+
+			if tt.responseBody != "" {
+				rt.AddResponse(http.StatusOK, tt.responseBody)
+			}
+
+			tags, err := driver.GetStorageTags()
+
+			if err != nil {
+				t.Fatalf("expected error: %v, got: %v", tt.expectError, err)
+			}
+
+			if !tt.expectError && !reflect.DeepEqual(tags, tt.expectedTags) {
+				t.Fatalf("expected tags %+v, got %+v", tt.expectedTags, tags)
+			}
+		})
+	}
+}
+
+// Test for PutStorageTags
+func TestPutStorageTags(t *testing.T) {
+	// Setup infrastructure and driver similar to existing tests
+	testBuilder := cirofake.NewFixturesBuilder()
+	testBuilder.AddInfraConfig(&configv1.Infrastructure{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster",
+		},
+		Status: configv1.InfrastructureStatus{
+			PlatformStatus: &configv1.PlatformStatus{
+				Type: configv1.AWSPlatformType,
+				AWS: &configv1.AWSPlatformStatus{
+					Region: "us-east-1",
+				},
+			},
+		},
+	})
+	testBuilder.AddSecrets(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      defaults.CloudCredentialsName,
+			Namespace: defaults.ImageRegistryOperatorNamespace,
+		},
+		Data: map[string][]byte{
+			"aws_access_key_id":     []byte("access"),
+			"aws_secret_access_key": []byte("secret"),
+		},
+	})
+	listers := testBuilder.BuildListers()
+
+	// Set up the round tripper and driver
+	rt := &tripper{}
+	TestFeatureGateAccessor := featuregates.NewHardcodedFeatureGateAccess(
+		[]configv1.FeatureGateName{util.TestFeatureGateName},
+		[]configv1.FeatureGateName{},
+	)
+
+	// Configure the driver with a valid bucket name in the Config field
+	driver := &driver{
+		Context:             context.TODO(),
+		Config:              &imageregistryv1.ImageRegistryConfigStorageS3{Bucket: "test-bucket"},
+		Listers:             &listers.StorageListers,
+		roundTripper:        rt,
+		featureGateAccessor: TestFeatureGateAccessor,
+	}
+
+	testCases := []struct {
+		name          string
+		tagMap        map[string]string
+		responseCodes []int
+		expectError   bool
+		expectedTags  []*s3.Tag
+		noTagRequest  bool
+	}{
+		{
+			name:          "successfully add/overwrite tags",
+			tagMap:        map[string]string{"Key1": "Value1", "Key2": "Value2"},
+			responseCodes: []int{http.StatusOK},
+			expectedTags: []*s3.Tag{
+				{Key: aws.String("Key1"), Value: aws.String("Value1")},
+				{Key: aws.String("Key2"), Value: aws.String("Value2")},
+			},
+			expectError: false, // No error should be expected here
+		},
+		{
+			name:         "empty tags should not trigger S3 call",
+			tagMap:       map[string]string{},
+			noTagRequest: true,
+			expectError:  false, // No error expected
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			rt.reqBodies = nil
+			rt.responseCodes = tt.responseCodes
+
+			err := driver.PutStorageTags(tt.tagMap)
+
+			if err != nil {
+				t.Fatalf("expected error: %v, got: %v", tt.expectError, err)
+			}
+
+			if tt.noTagRequest {
+				if len(rt.reqBodies) != 0 {
+					t.Fatalf("expected no requests, but got %d requests", len(rt.reqBodies))
+				}
+				return
+			}
+
+			for _, body := range rt.reqBodies {
+				// Look for the "Tagging" part in the request body
+				if !strings.Contains(string(body), "Tagging") {
+					continue
+				}
+
+				buf := bytes.NewBuffer(body)
+				tagging := s3.Tagging{}
+				xmldec := xml.NewDecoder(buf)
+
+				if err := xmlutil.UnmarshalXML(&tagging, xmldec, ""); err != nil {
+					t.Fatalf("error decoding tagging request: %s", err)
+				}
+
+				if !reflect.DeepEqual(tagging.TagSet, tt.expectedTags) {
+					t.Fatalf("expected tags %+v, received %+v", tt.expectedTags, tagging.TagSet)
+				}
+				return
+			}
+
+			if !tt.noTagRequest && len(rt.reqBodies) == 0 {
+				t.Fatal("expected request body but none was found")
+			}
 		})
 	}
 }
